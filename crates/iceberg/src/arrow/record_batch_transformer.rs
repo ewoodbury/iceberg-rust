@@ -314,14 +314,38 @@ impl PromotePlan {
                 source_by_id.insert(id, idx);
             }
         }
-        // Reachable for id-less files with nested types because the reader only
-        // applies name mapping to top-level fields; error rather than silently
-        // nulling every child.
+        // Name mapping only stamps ids on top-level fields, so nested children
+        // can be id-less. If names, arity, and types already match, rebuild
+        // positionally (relabel only). Otherwise order cannot be recovered.
         if !source_fields.is_empty() && source_by_id.is_empty() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "cannot reconcile struct fields by id: no source field carries a field id",
-            ));
+            let unchanged = source_fields.len() == target_fields.len()
+                && source_fields.iter().zip(target_fields.iter()).all(
+                    |(source_field, target_field)| {
+                        source_field.name() == target_field.name()
+                            && source_field
+                                .data_type()
+                                .equals_datatype(target_field.data_type())
+                    },
+                );
+            if !unchanged {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "cannot reconcile struct fields by id: no source field carries a field id",
+                ));
+            }
+            return source_fields
+                .iter()
+                .zip(target_fields.iter())
+                .enumerate()
+                .map(|(source_index, (source_field, target_field))| {
+                    Self::build(
+                        source_field.data_type(),
+                        target_field.data_type(),
+                        snapshot_schema,
+                    )
+                    .map(|plan| ChildPlan::FromSource { source_index, plan })
+                })
+                .collect();
         }
 
         target_fields
@@ -1105,7 +1129,10 @@ impl RecordBatchTransformer {
                 let column_source = if let Some((source_field, source_index)) =
                     field_id_to_source_schema_map.get(field_id)
                 {
-                    if source_field.data_type().equals_datatype(target_type) {
+                    // Nested names and field ids are part of column identity.
+                    // `equals_datatype` ignores both and would pass through a
+                    // rename or a drop-then-re-add of the same name.
+                    if source_field.data_type() == target_type {
                         ColumnSource::PassThrough {
                             source_index: *source_index,
                         }
@@ -1676,6 +1703,76 @@ mod test {
         assert_eq!(s.column(0).as_primitive::<Int32Type>().values(), &[1, 2]);
     }
 
+    fn transform_nested_struct(
+        snapshot_children: Vec<crate::spec::NestedFieldRef>,
+        file_struct: StructArray,
+    ) -> crate::Result<StructArray> {
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "s",
+                        Type::Struct(crate::spec::StructType::new(snapshot_children)),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+        let n = file_struct.len() as i32;
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            simple_field("s", file_struct.data_type().clone(), true, "2"),
+        ]));
+        let batch = RecordBatch::try_new(file_schema, vec![
+            Arc::new(Int32Array::from((0..n).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(file_struct) as ArrayRef,
+        ])
+        .unwrap();
+        Ok(transformer
+            .process_record_batch(batch)?
+            .column(1)
+            .as_struct()
+            .clone())
+    }
+
+    #[test]
+    fn promote_pure_nested_rename_via_process_record_batch() {
+        let file = StructArray::new(
+            Fields::from(vec![simple_field("x_old", DataType::Int32, true, "5")]),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef],
+            None,
+        );
+        let s = transform_nested_struct(
+            vec![NestedField::optional(5, "x", Type::Primitive(PrimitiveType::Int)).into()],
+            file,
+        )
+        .unwrap();
+        assert_eq!(s.fields()[0].name(), "x");
+        assert_eq!(s.column(0).as_primitive::<Int32Type>().values(), &[
+            10, 20, 30
+        ]);
+    }
+
+    #[test]
+    fn promote_struct_dropped_and_readded_same_name_nulls_by_id() {
+        let file = StructArray::new(
+            Fields::from(vec![simple_field("x", DataType::Int32, true, "5")]),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+            None,
+        );
+        let s = transform_nested_struct(
+            vec![NestedField::optional(6, "x", Type::Primitive(PrimitiveType::Int)).into()],
+            file,
+        )
+        .unwrap();
+        assert_eq!(s.column(0).null_count(), 2);
+    }
+
     #[test]
     fn promote_struct_promotes_child_primitive() {
         let source = Arc::new(StructArray::new(
@@ -1720,6 +1817,44 @@ mod test {
         )) as ArrayRef;
 
         let err = promote(&source, &evolved_struct_type(), &empty_schema()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no source field carries a field id")
+        );
+    }
+
+    #[test]
+    fn promote_idless_nested_unchanged_struct_keeps_data() {
+        let file = StructArray::new(
+            Fields::from(vec![Field::new("x", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef],
+            None,
+        );
+        let s = transform_nested_struct(
+            vec![NestedField::optional(5, "x", Type::Primitive(PrimitiveType::Int)).into()],
+            file,
+        )
+        .unwrap();
+        assert_eq!(s.fields()[0].name(), "x");
+        assert_eq!(s.column(0).as_primitive::<Int32Type>().values(), &[
+            10, 20, 30
+        ]);
+    }
+
+    #[test]
+    fn promote_idless_nested_renamed_struct_errors() {
+        let source = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new("x_old", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        let target = DataType::Struct(Fields::from(vec![simple_field(
+            "x",
+            DataType::Int32,
+            true,
+            "5",
+        )]));
+        let err = promote(&source, &target, &empty_schema()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("no source field carries a field id")
