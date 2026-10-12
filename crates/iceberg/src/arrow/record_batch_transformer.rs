@@ -164,12 +164,12 @@ pub(crate) enum ColumnSource {
         target_type: DataType,
     },
 
-    // Inserts a schema-evolution default value (the field's `initial_default`,
+    // Inserts a schema-evolution default (the field's `initial_default`,
     // or null for an absent optional field). Distinct from `ConstantLookup`:
     // this value comes from the table schema, not the per-file constant map.
     Add {
         target_type: DataType,
-        value: Option<PrimitiveLiteral>,
+        value: AddedColumn,
     },
 
     // A metadata column read from the file and coalesced with a per-file
@@ -228,8 +228,136 @@ pub(crate) enum ChildPlan {
     },
     Add {
         target_type: DataType,
-        value: Option<PrimitiveLiteral>,
+        value: AddedColumn,
     },
+}
+
+/// Value used to fill a field that is not in the data file.
+///
+/// A scalar `None` is a typed null. [`AddedColumn::Struct`] is the spec's
+/// non-null struct default `{}`: the struct is present, and each child is
+/// resolved on its own (its `initial-default`, else null).
+#[derive(Debug)]
+pub(crate) enum AddedColumn {
+    Scalar(Option<PrimitiveLiteral>),
+    Struct {
+        fields: Fields,
+        children: Vec<AddedColumn>,
+    },
+}
+
+/// Schema and per-file constants shared while resolving an absent field.
+#[derive(Clone, Copy)]
+struct AbsentFieldCtx<'a> {
+    snapshot_schema: &'a IcebergSchema,
+    constant_fields: &'a HashMap<i32, ColumnConstant>,
+    /// Top-level absent columns use "Missing required field". Nested ones keep
+    /// the nested wording existing callers match on.
+    top_level: bool,
+}
+
+impl AbsentFieldCtx<'_> {
+    /// Column projection for a field that is not in the file: identity constant,
+    /// then `initial-default`, then null. A struct default of `{}` (no field
+    /// values; JSON `{}` is stored as one missing value per child) builds a
+    /// non-null struct and resolves each child the same way.
+    fn resolve(
+        &self,
+        field_id: Option<i32>,
+        name: &str,
+        target_type: &DataType,
+        arrow_nullable: bool,
+    ) -> Result<AddedColumn> {
+        if let Some(id) = field_id
+            && let Some(ColumnConstant::Scalar(datum)) = self.constant_fields.get(&id)
+        {
+            return Ok(AddedColumn::Scalar(Some(datum.literal().clone())));
+        }
+
+        let Some(field) = field_id.and_then(|id| self.snapshot_schema.field_by_id(id)) else {
+            return self.absent(name, !arrow_nullable);
+        };
+        match field.initial_default.as_ref() {
+            Some(Literal::Primitive(prim)) => Ok(AddedColumn::Scalar(Some(prim.clone()))),
+            // `{}` has no field values. An explicit child value stays unsupported.
+            Some(Literal::Struct(struct_value))
+                if struct_value.fields().iter().all(|value| value.is_none()) =>
+            {
+                self.empty_struct(field.as_ref(), name, target_type)
+            }
+            Some(_) => Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "Cannot read field {name} that is absent from the data file: \
+                     applying a non-primitive initial-default for {} is not yet supported",
+                    field.field_type
+                ),
+            )),
+            None => self.absent(name, field.required),
+        }
+    }
+
+    fn empty_struct(
+        &self,
+        field: &crate::spec::NestedField,
+        name: &str,
+        target_type: &DataType,
+    ) -> Result<AddedColumn> {
+        let crate::spec::Type::Struct(struct_type) = field.field_type.as_ref() else {
+            return Err(invalid_data!(
+                "struct initial-default on non-struct field {name}"
+            ));
+        };
+        let DataType::Struct(arrow_fields) = target_type else {
+            return Err(invalid_data!(
+                "struct initial-default for {name} has Arrow type {target_type}"
+            ));
+        };
+        if struct_type.fields().len() != arrow_fields.len() {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "struct {name} has {} fields in the table schema and {} in the arrow type",
+                    struct_type.fields().len(),
+                    arrow_fields.len()
+                ),
+            ));
+        }
+        let nested = AbsentFieldCtx {
+            top_level: false,
+            ..*self
+        };
+        let children = struct_type
+            .fields()
+            .iter()
+            .zip(arrow_fields.iter())
+            .map(|(child, arrow_field)| {
+                nested.resolve(
+                    Some(child.id),
+                    &child.name,
+                    arrow_field.data_type(),
+                    arrow_field.is_nullable(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AddedColumn::Struct {
+            fields: arrow_fields.clone(),
+            children,
+        })
+    }
+
+    fn absent(&self, name: &str, required: bool) -> Result<AddedColumn> {
+        if !required {
+            return Ok(AddedColumn::Scalar(None));
+        }
+        Err(if self.top_level {
+            invalid_data!("Missing required field: {name}")
+        } else {
+            invalid_data!(
+                "required nested field {name} is absent from the data file and has no initial-default"
+            )
+        })
+    }
 }
 
 impl PromotePlan {
@@ -355,38 +483,20 @@ impl PromotePlan {
                         source_index,
                     }),
                     None => {
-                        // Identity partition constants apply inside structs too. A missing
-                        // child uses that value before initial-default (#3261) or null.
-                        if let Some(ColumnConstant::Scalar(datum)) =
-                            field_id.and_then(|id| constant_fields.get(&id))
-                        {
-                            return Ok(ChildPlan::Add {
-                                target_type: target_field.data_type().clone(),
-                                value: Some(datum.literal().clone()),
-                            });
+                        let value = AbsentFieldCtx {
+                            snapshot_schema,
+                            constant_fields,
+                            top_level: false,
                         }
-                        // Missing nested fields are null-filled. Applying an
-                        // initial-default here is not implemented yet (#3261).
-                        let iceberg_field =
-                            field_id.and_then(|id| snapshot_schema.field_by_id(id));
-                        if iceberg_field.is_some_and(|f| f.initial_default.is_some()) {
-                            return Err(Error::new(
-                                ErrorKind::FeatureUnsupported,
-                                format!(
-                                    "initial-default of nested field {} is not supported, see https://github.com/apache/iceberg-rust/issues/3261",
-                                    target_field.name()
-                                ),
-                            ));
-                        }
-                        if iceberg_field.map_or(!target_field.is_nullable(), |f| f.required) {
-                            return Err(invalid_data!(
-                                "required nested field {} is absent from the data file and has no initial-default",
-                                target_field.name()
-                            ));
-                        }
+                        .resolve(
+                            field_id,
+                            target_field.name(),
+                            target_field.data_type(),
+                            target_field.is_nullable(),
+                        )?;
                         Ok(ChildPlan::Add {
                             target_type: target_field.data_type().clone(),
-                            value: None,
+                            value,
                         })
                     }
                 }
@@ -452,7 +562,7 @@ impl PromotePlan {
                     plan.apply(source.column(*source_index))
                 }
                 ChildPlan::Add { target_type, value } => {
-                    RecordBatchTransformer::create_column(target_type, value.as_ref(), source.len())
+                    RecordBatchTransformer::materialize_added(value, target_type, source.len())
                 }
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1142,31 +1252,19 @@ impl RecordBatchTransformer {
                     // column that violates the field's required constraint. This matches
                     // Iceberg-Java's Parquet readers (BaseParquetReaders / SparkParquetReaders),
                     // which raise "Missing required field: <name>".
-                    if iceberg_field.initial_default.is_none() && iceberg_field.required {
-                        return Err(invalid_data!("Missing required field: {}", iceberg_field.name));
+                    let value = AbsentFieldCtx {
+                        snapshot_schema,
+                        constant_fields,
+                        top_level: true,
                     }
-
-                    // TODO: Support the spec-defined non-null struct initial default `{}` by
-                    // creating a non-null struct and applying each child's initial default.
-                    // Tracked in https://github.com/apache/iceberg-rust/issues/3261.
-                    let default_value = match iceberg_field.initial_default.as_ref() {
-                        None => None,
-                        Some(Literal::Primitive(prim)) => Some(prim.clone()),
-                        Some(_) => {
-                            return Err(Error::new(
-                                ErrorKind::FeatureUnsupported,
-                                format!(
-                                    "Cannot read field {} that is absent from the data file: \
-                                     applying a non-primitive initial-default for {} is not yet \
-                                     supported",
-                                    iceberg_field.name, iceberg_field.field_type
-                                ),
-                            ));
-                        }
-                    };
-
+                    .resolve(
+                        Some(*field_id),
+                        &iceberg_field.name,
+                        target_type,
+                        !iceberg_field.required,
+                    )?;
                     ColumnSource::Add {
-                        value: default_value,
+                        value,
                         target_type: target_type.clone(),
                     }
                 };
@@ -1212,7 +1310,7 @@ impl RecordBatchTransformer {
                     }
 
                     ColumnSource::Add { target_type, value } => {
-                        Self::create_column(target_type, value.as_ref(), num_rows)?
+                        Self::materialize_added(value, target_type, num_rows)?
                     }
 
                     // Resolve the per-file constant for this field id from the map and
@@ -1295,6 +1393,31 @@ impl RecordBatchTransformer {
         // constant/null/coalesce paths (not for compression -- a per-row-varying column
         // gains nothing from REE).
         Ok(cast(&coalesced, target_type)?)
+    }
+
+    fn materialize_added(
+        value: &AddedColumn,
+        target_type: &DataType,
+        num_rows: usize,
+    ) -> Result<ArrayRef> {
+        match value {
+            AddedColumn::Scalar(prim) => Self::create_column(target_type, prim.as_ref(), num_rows),
+            AddedColumn::Struct { fields, children } => {
+                let child_arrays = children
+                    .iter()
+                    .zip(fields.iter())
+                    .map(|(child, field)| {
+                        Self::materialize_added(child, field.data_type(), num_rows)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                // No null buffer: `{}` means the struct value itself is present.
+                Ok(Arc::new(StructArray::try_new(
+                    fields.clone(),
+                    child_arrays,
+                    None,
+                )?))
+            }
+        }
     }
 
     fn create_column(
@@ -1773,20 +1896,68 @@ mod test {
     }
 
     #[test]
-    fn promote_nested_field_with_initial_default_errors() {
+    fn promote_nested_initial_default_fills_missing_child() {
+        // Spec default-values rows: a present struct fills a missing child from
+        // that child's initial-default, and a null struct stays null.
         let schema = Schema::builder()
             .with_fields(vec![
+                NestedField::optional(5, "x", Type::Primitive(PrimitiveType::Int)).into(),
                 NestedField::optional(6, "y", Type::Primitive(PrimitiveType::Int))
-                    .with_initial_default(Literal::int(42))
+                    .with_initial_default(Literal::int(0))
                     .into(),
             ])
             .build()
             .unwrap();
-        let source = unevolved_struct_data(vec![1, 2]) as ArrayRef;
+        let source = Arc::new(StructArray::new(
+            Fields::from(vec![field_with_id("x", DataType::Int32, true, 5)]),
+            vec![Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef],
+            Some(NullBuffer::from(vec![true, false])),
+        )) as ArrayRef;
+        let out = promote(&source, &evolved_struct_type(), &schema).unwrap();
+        let expected = StructArray::new(
+            Fields::from(vec![
+                field_with_id("x", DataType::Int32, true, 5),
+                field_with_id("y", DataType::Int32, true, 6),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![0, 0])) as ArrayRef,
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        assert_eq!(out.as_struct(), &expected);
 
-        let err = promote(&source, &evolved_struct_type(), &schema).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-        assert!(err.to_string().contains("initial-default"));
+        // The other child is the one in the file. Its value is kept; the missing
+        // sibling uses its own default. A null stored in the file is not a default.
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(5, "x", Type::Primitive(PrimitiveType::Int))
+                    .with_initial_default(Literal::int(0))
+                    .into(),
+                NestedField::optional(6, "y", Type::Primitive(PrimitiveType::Int))
+                    .with_initial_default(Literal::int(7))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+        let source = Arc::new(StructArray::new(
+            Fields::from(vec![field_with_id("y", DataType::Int32, true, 6)]),
+            vec![Arc::new(Int32Array::from(vec![Some(-1), None])) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        let out = promote(&source, &evolved_struct_type(), &schema).unwrap();
+        let expected = StructArray::new(
+            Fields::from(vec![
+                field_with_id("x", DataType::Int32, true, 5),
+                field_with_id("y", DataType::Int32, true, 6),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 0])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(-1), None])) as ArrayRef,
+            ],
+            None,
+        );
+        assert_eq!(out.as_struct(), &expected);
     }
 
     #[test]
@@ -2269,19 +2440,111 @@ mod test {
     }
 
     #[test]
-    fn schema_evolution_absent_struct_with_initial_default_errors() {
-        for required in [false, true] {
-            let added_field = NestedField::new(
-                2,
-                "added_struct",
-                Type::Struct(StructType::new(vec![
-                    NestedField::optional(3, "child", Type::Primitive(PrimitiveType::Int))
-                        .with_initial_default(Literal::int(42))
-                        .into(),
-                ])),
-                required,
+    fn schema_evolution_absent_struct_initial_default() {
+        let struct_type = Type::Struct(StructType::new(vec![
+            NestedField::optional(3, "child", Type::Primitive(PrimitiveType::Int))
+                .with_initial_default(Literal::int(42))
+                .into(),
+        ]));
+        // `{}` and the JSON form (one missing value per child) are the same: a
+        // non-null struct whose child uses its own initial-default.
+        for (required, default) in [
+            (false, Literal::Struct(Struct::empty())),
+            (true, Literal::Struct(Struct::from_iter(vec![None]))),
+        ] {
+            let added_field = NestedField::new(2, "added_struct", struct_type.clone(), required)
+                .with_initial_default(default);
+            let snapshot_schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                        added_field.into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let arrow_schema = schema_to_arrow_schema(&snapshot_schema).unwrap();
+            let DataType::Struct(child_fields) = arrow_schema.field(1).data_type() else {
+                panic!("added_struct");
+            };
+            let mut transformer =
+                RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+            let file_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
+                "id",
+                DataType::Int32,
+                false,
+                1,
+            )]));
+            let file_batch =
+                RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+                    .unwrap();
+            let out = transformer.process_record_batch(file_batch).unwrap();
+            let expected = StructArray::try_new(
+                child_fields.clone(),
+                vec![Arc::new(Int32Array::from(vec![42, 42, 42])) as ArrayRef],
+                None,
             )
-            .with_initial_default(Literal::Struct(Struct::from_iter(vec![None])));
+            .unwrap();
+            assert_eq!(out.column(1).as_struct(), &expected, "required={required}");
+        }
+
+        // A null struct default does not apply child defaults. The column is null.
+        let added_field = NestedField::optional(
+            2,
+            "added_struct",
+            Type::Struct(StructType::new(vec![
+                NestedField::optional(3, "child", Type::Primitive(PrimitiveType::Int))
+                    .with_initial_default(Literal::int(42))
+                    .into(),
+            ])),
+        );
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    added_field.into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+        let file_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
+            "id",
+            DataType::Int32,
+            false,
+            1,
+        )]));
+        let file_batch =
+            RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+                .unwrap();
+        let out = transformer.process_record_batch(file_batch).unwrap();
+        assert_eq!(out.column(1).null_count(), 3);
+
+        // List literals and a struct default that embeds a child value stay unsupported.
+        for default in [
+            Literal::List(vec![Some(Literal::int(1))]),
+            Literal::Struct(Struct::from_iter(vec![Some(Literal::int(1))])),
+        ] {
+            let added_field = match &default {
+                Literal::List(_) => NestedField::optional(
+                    2,
+                    "added",
+                    Type::List(ListType::new(
+                        NestedField::list_element(3, Type::Primitive(PrimitiveType::Int), false)
+                            .into(),
+                    )),
+                )
+                .with_initial_default(default),
+                _ => NestedField::optional(
+                    2,
+                    "added",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "child", Type::Primitive(PrimitiveType::Int))
+                            .into(),
+                    ])),
+                )
+                .with_initial_default(default),
+            };
             let snapshot_schema = Arc::new(
                 Schema::builder()
                     .with_fields(vec![
@@ -2302,25 +2565,12 @@ mod test {
             let file_batch =
                 RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
                     .unwrap();
-
-            let err = transformer
-                .process_record_batch(file_batch)
-                .expect_err(&format!(
-                    "required={required}: complex default should be rejected"
-                ));
-            assert_eq!(
-                err.kind(),
-                ErrorKind::FeatureUnsupported,
-                "required={required}"
-            );
-            assert!(
-                err.to_string().contains("Cannot read field added_struct"),
-                "required={required}: {err}"
-            );
+            let err = transformer.process_record_batch(file_batch).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
             assert!(
                 err.to_string()
                     .contains("applying a non-primitive initial-default"),
-                "required={required}: {err}"
+                "{err}"
             );
         }
     }
