@@ -1403,6 +1403,11 @@ impl RecordBatchTransformer {
         match value {
             AddedColumn::Scalar(prim) => Self::create_column(target_type, prim.as_ref(), num_rows),
             AddedColumn::Struct { fields, children } => {
+                // A field-less struct has no child array to take a length from.
+                // `None` nulls: `{}` is present on every row, not a null struct.
+                if fields.is_empty() {
+                    return Ok(Arc::new(StructArray::new_empty_fields(num_rows, None)));
+                }
                 let child_arrays = children
                     .iter()
                     .zip(fields.iter())
@@ -1410,7 +1415,6 @@ impl RecordBatchTransformer {
                         Self::materialize_added(child, field.data_type(), num_rows)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                // No null buffer: `{}` means the struct value itself is present.
                 Ok(Arc::new(StructArray::try_new(
                     fields.clone(),
                     child_arrays,
@@ -2573,6 +2577,154 @@ mod test {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn schema_evolution_fieldless_struct_default_is_present() {
+        // `struct<>` has no child array, so the length has to be set explicitly.
+        // `{}` is present on every row. Java materializes that constant directly.
+        let added = NestedField::optional(2, "s", Type::Struct(StructType::new(vec![])))
+            .with_initial_default(Literal::Struct(Struct::empty()));
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    added.into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+        let file_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
+            "id",
+            DataType::Int32,
+            false,
+            1,
+        )]));
+        let file_batch =
+            RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+                .unwrap();
+        let out = transformer.process_record_batch(file_batch).unwrap();
+        let column = out.column(1);
+        assert_eq!(column.len(), 3);
+        assert_eq!(column.null_count(), 0);
+        assert_eq!(column.as_struct().columns().len(), 0);
+    }
+
+    #[test]
+    fn promote_missing_nested_struct_default_is_present() {
+        // Parent is in the file. The added inner struct's default is `{}`, so a
+        // non-null parent yields a non-null inner whose child uses its own default.
+        // A null parent stays null. Same rule as Java's structReader.
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(5, "x", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    7,
+                    "inner",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(8, "y", Type::Primitive(PrimitiveType::Int))
+                            .with_initial_default(Literal::int(0))
+                            .into(),
+                    ])),
+                )
+                .with_initial_default(Literal::Struct(Struct::from_iter(vec![None])))
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let source = Arc::new(StructArray::new(
+            Fields::from(vec![field_with_id("x", DataType::Int32, true, 5)]),
+            vec![Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef],
+            Some(NullBuffer::from(vec![true, false])),
+        )) as ArrayRef;
+        let inner = StructArray::try_new(
+            Fields::from(vec![field_with_id("y", DataType::Int32, true, 8)]),
+            vec![Arc::new(Int32Array::from(vec![0, 0])) as ArrayRef],
+            None,
+        )
+        .unwrap();
+        let target = DataType::Struct(Fields::from(vec![
+            field_with_id("x", DataType::Int32, true, 5),
+            field_with_id("inner", inner.data_type().clone(), true, 7),
+        ]));
+        let out = promote(&source, &target, &schema).unwrap();
+        let expected = StructArray::new(
+            Fields::from(vec![
+                field_with_id("x", DataType::Int32, true, 5),
+                field_with_id("inner", inner.data_type().clone(), true, 7),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+                Arc::new(inner) as ArrayRef,
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        assert_eq!(out.as_struct(), &expected);
+    }
+
+    #[test]
+    fn promote_list_element_initial_default_keeps_null_elements() {
+        // A null list element stays null. A present element fills the added field.
+        let element_type = Type::Struct(StructType::new(vec![
+            NestedField::optional(5, "x", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(6, "y", Type::Primitive(PrimitiveType::Int))
+                .with_initial_default(Literal::int(0))
+                .into(),
+        ]));
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::list_element(4, element_type, false).into(),
+            ])
+            .build()
+            .unwrap();
+        let source_elements = StructArray::new(
+            Fields::from(vec![field_with_id("x", DataType::Int32, true, 5)]),
+            vec![Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        let element_field = field_with_id("element", source_elements.data_type().clone(), true, 4);
+        let source = Arc::new(
+            ListArray::try_new(
+                Arc::new(element_field),
+                OffsetBuffer::new(vec![0, 2].into()),
+                Arc::new(source_elements) as ArrayRef,
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let expected_elements = StructArray::try_new(
+            Fields::from(vec![
+                field_with_id("x", DataType::Int32, true, 5),
+                field_with_id("y", DataType::Int32, true, 6),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![0, 0])) as ArrayRef,
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap();
+        let target = DataType::List(Arc::new(field_with_id(
+            "element",
+            expected_elements.data_type().clone(),
+            true,
+            4,
+        )));
+        let out = promote(&source, &target, &schema).unwrap();
+        let expected = ListArray::try_new(
+            Arc::new(field_with_id(
+                "element",
+                expected_elements.data_type().clone(),
+                true,
+                4,
+            )),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(expected_elements) as ArrayRef,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.as_list::<i32>(), &expected);
     }
 
     #[test]

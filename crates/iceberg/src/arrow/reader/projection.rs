@@ -417,6 +417,12 @@ struct FileStruct {
     depth: usize,
 }
 
+/// A leaf chosen only for a struct's definition level.
+struct ChosenLeaf {
+    index: usize,
+    id: i32,
+}
+
 /// One leaf under each projected struct that would otherwise contribute no column.
 ///
 /// Deepest struct first, so an inner struct's leaf also covers its ancestors.
@@ -427,7 +433,7 @@ fn presence_leaves(
     iceberg_schema: &Schema,
     arrow_schema: &ArrowSchema,
     requested_leaves: &HashSet<i32>,
-) -> Vec<FileLeaf> {
+) -> Vec<ChosenLeaf> {
     let projected = projected_struct_ids(iceberg_schema, requested_leaves);
     if projected.is_empty() {
         return Vec::new();
@@ -468,11 +474,9 @@ fn presence_leaves(
         }
         if let Some(leaf) = best {
             covered_ids.insert(leaf.id);
-            chosen.push(FileLeaf {
+            chosen.push(ChosenLeaf {
                 index: leaf.index,
                 id: leaf.id,
-                repetition: leaf.repetition,
-                ancestors: leaf.ancestors.clone(),
             });
         }
     }
