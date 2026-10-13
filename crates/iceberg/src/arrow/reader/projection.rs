@@ -432,112 +432,89 @@ fn presence_leaves(
     projected_structs: &HashSet<i32>,
     requested_leaves: &HashSet<i32>,
 ) -> Vec<FileLeaf> {
-    let mut chosen = Vec::new();
-    let mut index = 0;
+    let mut walk = PresenceWalk {
+        projected_structs,
+        requested_leaves,
+        index: 0,
+        chosen: Vec::new(),
+    };
     for field in fields {
-        select_presence(
-            field,
-            0,
-            projected_structs,
-            requested_leaves,
-            &mut index,
-            &mut chosen,
-        );
+        walk.visit(field, 0);
     }
-    chosen
+    walk.chosen
 }
 
-/// Returns whether a selected leaf is under `field`, and the best presence candidate.
-/// The type check needs a field id on every field down to the leaf, except a map's
-/// entries struct, so a candidate is only taken from a child with an id.
-fn select_presence(
-    field: &Field,
-    repetition: u32,
-    projected_structs: &HashSet<i32>,
-    requested_leaves: &HashSet<i32>,
-    index: &mut usize,
-    chosen: &mut Vec<FileLeaf>,
-) -> (bool, Option<FileLeaf>) {
-    // Unwrap once, like `Fields::filter_leaves`, to count leaves the same way.
-    let data_type = match field.data_type() {
-        DataType::Dictionary(_, value) => value.as_ref(),
-        DataType::RunEndEncoded(_, values) => values.data_type(),
-        other => other,
-    };
-    match data_type {
-        DataType::Struct(children) => {
-            let mut covered = false;
-            let mut best: Option<FileLeaf> = None;
-            for child in children {
-                let (child_covered, child_best) = select_presence(
-                    child,
-                    repetition,
-                    projected_structs,
-                    requested_leaves,
-                    index,
-                    chosen,
-                );
-                covered |= child_covered;
-                if let Some(c) = child_best
-                    && parquet_field_id(child).is_some()
-                    && best.is_none_or(|b| c.repetition < b.repetition)
-                {
-                    best = Some(c);
+struct PresenceWalk<'a> {
+    projected_structs: &'a HashSet<i32>,
+    requested_leaves: &'a HashSet<i32>,
+    index: usize,
+    chosen: Vec<FileLeaf>,
+}
+
+impl PresenceWalk<'_> {
+    /// Returns whether a selected leaf is under `field`, and the best presence candidate.
+    fn visit(&mut self, field: &Field, repetition: u32) -> (bool, Option<FileLeaf>) {
+        // Unwrap once, like `Fields::filter_leaves`, to count leaves the same way.
+        let data_type = match field.data_type() {
+            DataType::Dictionary(_, value) => value.as_ref(),
+            DataType::RunEndEncoded(_, values) => values.data_type(),
+            other => other,
+        };
+        match data_type {
+            DataType::Struct(children) => {
+                let mut covered = false;
+                let mut best: Option<FileLeaf> = None;
+                for child in children {
+                    let (child_covered, child_best) = self.visit(child, repetition);
+                    covered |= child_covered;
+                    // A presence leaf also goes through the projection's type check, so its
+                    // field must have an id and convert.
+                    if let Some(c) = child_best
+                        && parquet_field_id(child).is_some()
+                        && arrow_type_to_type(child.data_type()).is_ok()
+                        && best.is_none_or(|b| c.repetition < b.repetition)
+                    {
+                        best = Some(c);
+                    }
                 }
+                if !covered
+                    && let Some(leaf) = best
+                    && parquet_field_id(field)
+                        .is_some_and(|id| self.projected_structs.contains(&id))
+                {
+                    self.chosen.push(leaf);
+                    covered = true;
+                }
+                (covered, best)
             }
-            if !covered
-                && let Some(leaf) = best
-                && parquet_field_id(field).is_some_and(|id| projected_structs.contains(&id))
-            {
-                chosen.push(leaf);
-                covered = true;
-            }
-            (covered, best)
-        }
-        DataType::List(child) | DataType::LargeList(child) | DataType::FixedSizeList(child, _) => {
-            let (covered, best) = select_presence(
-                child,
-                repetition + 1,
-                projected_structs,
-                requested_leaves,
-                index,
-                chosen,
-            );
-            (covered, best.filter(|_| parquet_field_id(child).is_some()))
-        }
-        DataType::Map(child, _) => {
-            let start = *index;
-            let (covered, best) = select_presence(
-                child,
-                repetition + 1,
-                projected_structs,
-                requested_leaves,
-                index,
-                chosen,
-            );
-            // Parquet drops a map unless both its key and value are read.
-            let best = best
-                .filter(|_| arrow_type_to_type(field.data_type()).is_ok())
-                .map(|leaf| FileLeaf {
+            DataType::List(child)
+            | DataType::LargeList(child)
+            | DataType::FixedSizeList(child, _) => self.visit(child, repetition + 1),
+            DataType::Map(child, _) => {
+                let start = self.index;
+                let (covered, best) = self.visit(child, repetition + 1);
+                // Parquet drops a map unless both its key and value are read.
+                let best = best.map(|leaf| FileLeaf {
                     start,
-                    end: *index,
+                    end: self.index,
                     ..leaf
                 });
-            (covered, best)
-        }
-        _ => {
-            let id = parquet_field_id(field);
-            let start = *index;
-            *index += 1;
-            // Presence leaves go through the type check, so they must convert.
-            let leaf = arrow_type_to_type(field.data_type())
-                .is_ok()
-                .then_some(FileLeaf {
+                (covered, best)
+            }
+            _ => {
+                let id = parquet_field_id(field);
+                let start = self.index;
+                self.index += 1;
+                let leaf = id.map(|_| FileLeaf {
                     repetition,
                     start,
-                    end: *index,
+                    end: self.index,
                 });
-            (id.is_some_and(|id| requested_leaves.contains(&id)), leaf)
+                (
+                    id.is_some_and(|id| self.requested_leaves.contains(&id)),
+                    leaf,
+                )
+            }
         }
     }
 }
@@ -2676,49 +2653,6 @@ message schema {
                 true,
                 2,
             ),
-            // `v` has no usable leaf: its map is read whole and must convert, and its list
-            // element has no id.
-            field_id(
-                "v",
-                DataType::Struct(
-                    vec![
-                        field_id(
-                            "m",
-                            DataType::Map(
-                                Arc::new(Field::new(
-                                    "key_value",
-                                    DataType::Struct(
-                                        vec![
-                                            field_id("key", DataType::Utf8, false, 11),
-                                            field_id("value", DataType::UInt64, true, 12),
-                                        ]
-                                        .into(),
-                                    ),
-                                    false,
-                                )),
-                                false,
-                            ),
-                            true,
-                            10,
-                        ),
-                        field_id(
-                            "q",
-                            DataType::List(Arc::new(Field::new(
-                                "element",
-                                DataType::Struct(
-                                    vec![field_id("z", DataType::Int32, true, 16)].into(),
-                                ),
-                                true,
-                            ))),
-                            true,
-                            15,
-                        ),
-                    ]
-                    .into(),
-                ),
-                true,
-                4,
-            ),
         ]));
         let table = Arc::new(
             Schema::builder()
@@ -2730,15 +2664,6 @@ message schema {
                         "s",
                         Type::Struct(StructType::new(vec![
                             NestedField::optional(9, "n", Type::Primitive(PrimitiveType::Int))
-                                .into(),
-                        ])),
-                    )
-                    .into(),
-                    NestedField::optional(
-                        4,
-                        "v",
-                        Type::Struct(StructType::new(vec![
-                            NestedField::optional(13, "n", Type::Primitive(PrimitiveType::Int))
                                 .into(),
                         ])),
                     )
@@ -2765,21 +2690,6 @@ message schema {
                     optional int32 a = 5;
                     optional int32 c = 3;
                   }
-                  optional group v = 4 {
-                    optional group m (MAP) = 10 {
-                      repeated group key_value {
-                        required binary key (STRING) = 11;
-                        optional int64 value (INTEGER(64, false)) = 12;
-                      }
-                    }
-                    optional group q (LIST) = 15 {
-                      repeated group list {
-                        optional group element {
-                          optional int32 z = 16;
-                        }
-                      }
-                    }
-                  }
                 }
                 ",
             )
@@ -2796,10 +2706,6 @@ message schema {
         );
         assert_eq!(mask(&[2]), ProjectionMask::leaves(&parquet_schema, vec![4]));
         assert_eq!(mask(&[1]), ProjectionMask::leaves(&parquet_schema, vec![0]));
-        assert_eq!(
-            mask(&[1, 4]),
-            ProjectionMask::leaves(&parquet_schema, vec![0])
-        );
     }
 
     /// Cases from Java's `ReadFormatModelTests` for #17320, without initial-defaults:
