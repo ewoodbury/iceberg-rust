@@ -69,22 +69,29 @@ impl ArrowReader {
 
     /// Recursively extract leaf field IDs because Parquet projection works at the leaf column level.
     /// Nested types (struct/list/map) are flattened in Parquet's columnar format.
-    fn include_leaf_field_id(field: &NestedField, field_ids: &mut Vec<i32>) {
+    fn include_leaf_field_id(
+        field: &NestedField,
+        field_ids: &mut Vec<i32>,
+        struct_ids: &mut HashSet<i32>,
+    ) {
         match field.field_type.as_ref() {
             Type::Primitive(_) => {
                 field_ids.push(field.id);
             }
             Type::Struct(struct_type) => {
+                if !struct_type.fields().is_empty() {
+                    struct_ids.insert(field.id);
+                }
                 for nested_field in struct_type.fields() {
-                    Self::include_leaf_field_id(nested_field, field_ids);
+                    Self::include_leaf_field_id(nested_field, field_ids, struct_ids);
                 }
             }
             Type::List(list_type) => {
-                Self::include_leaf_field_id(&list_type.element_field, field_ids);
+                Self::include_leaf_field_id(&list_type.element_field, field_ids, struct_ids);
             }
             Type::Map(map_type) => {
-                Self::include_leaf_field_id(&map_type.key_field, field_ids);
-                Self::include_leaf_field_id(&map_type.value_field, field_ids);
+                Self::include_leaf_field_id(&map_type.key_field, field_ids, struct_ids);
+                Self::include_leaf_field_id(&map_type.value_field, field_ids, struct_ids);
             }
             // Variant projection is rejected earlier (in `get_arrow_projection_mask`); this
             // arm only keeps the match exhaustive. Treat it as a leaf, like a primitive.
@@ -150,15 +157,17 @@ impl ArrowReader {
 
             // Parquet's columnar format requires leaf-level (not top-level struct/list/map) projection
             let mut leaf_field_ids = vec![];
+            let mut struct_ids = HashSet::new();
             for field_id in field_ids {
                 let field = iceberg_schema_of_task.field_by_id(*field_id);
                 if let Some(field) = field {
-                    Self::include_leaf_field_id(field, &mut leaf_field_ids);
+                    Self::include_leaf_field_id(field, &mut leaf_field_ids, &mut struct_ids);
                 }
             }
 
             Self::get_arrow_projection_mask_with_field_ids(
                 &leaf_field_ids,
+                &struct_ids,
                 iceberg_schema_of_task,
                 parquet_schema,
                 arrow_schema,
@@ -171,6 +180,7 @@ impl ArrowReader {
     /// For iceberg-java compatibility with ParquetSchemaUtil.pruneColumns().
     fn get_arrow_projection_mask_with_field_ids(
         leaf_field_ids: &[i32],
+        projected_structs: &HashSet<i32>,
         iceberg_schema_of_task: &Schema,
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
@@ -180,12 +190,18 @@ impl ArrowReader {
         let fields = arrow_schema.fields();
         // HashSet for O(1) membership checks instead of O(n) slice scans.
         let leaf_field_id_set: HashSet<i32> = leaf_field_ids.iter().copied().collect();
+        // Keep presence leaves here too, or a map whose value struct lost every child
+        // keeps only its key and fails conversion.
+        let presence = presence_leaves(fields, projected_structs, &leaf_field_id_set);
+        let presence_ids: HashSet<i32> = presence.iter().map(|leaf| leaf.id).collect();
 
         // Pre-project only the fields that have been selected, possibly avoiding converting
         // some Arrow types that are not yet supported.
         let projected_arrow_schema = ArrowSchema::new_with_metadata(
             fields.filter_leaves(|_, f| {
-                parquet_field_id(f).is_some_and(|field_id| leaf_field_id_set.contains(&field_id))
+                parquet_field_id(f).is_some_and(|field_id| {
+                    leaf_field_id_set.contains(&field_id) || presence_ids.contains(&field_id)
+                })
             }),
             arrow_schema.metadata().clone(),
         );
@@ -219,14 +235,15 @@ impl ArrowReader {
 
         // Schema evolution: New columns may not exist in old Parquet files.
         // We only project existing columns; RecordBatchTransformer adds default/NULL values.
-        // If other leaves are selected, a struct whose requested leaves are all missing gets no
-        // column and reads as NULL (#3378).
-        let mut indices = Vec::with_capacity(leaf_field_ids.len());
+        let mut indices = Vec::with_capacity(leaf_field_ids.len() + presence.len());
         for field_id in leaf_field_ids {
             if let Some(col_idx) = column_map.get(field_id) {
                 indices.push(*col_idx);
             }
         }
+
+        // Read only for struct validity; `RecordBatchTransformer` drops these leaves.
+        indices.extend(presence.iter().map(|leaf| leaf.index));
 
         if indices.is_empty() {
             // Edge case: All requested columns are new (don't exist in file).
@@ -393,6 +410,106 @@ fn parquet_field_id(field: &Field) -> Option<i32> {
         .metadata()
         .get(PARQUET_FIELD_ID_META_KEY)
         .and_then(|field_id| i32::from_str(field_id).ok())
+}
+
+#[derive(Clone, Copy)]
+struct FileLeaf {
+    repetition: u32,
+    index: usize,
+    id: i32,
+}
+
+/// One file leaf under each projected struct that no selected leaf covers, so the
+/// struct keeps its definition level. Like Java's `PresenceColumnSelector`, inner
+/// structs go first, and the leaf with the lowest repetition level wins, then the first.
+fn presence_leaves(
+    fields: &Fields,
+    projected_structs: &HashSet<i32>,
+    requested_leaves: &HashSet<i32>,
+) -> Vec<FileLeaf> {
+    let mut chosen = Vec::new();
+    let mut index = 0;
+    for field in fields {
+        select_presence(
+            field,
+            0,
+            projected_structs,
+            requested_leaves,
+            &mut index,
+            &mut chosen,
+        );
+    }
+    chosen
+}
+
+/// Returns whether a selected leaf is under `field`, and the best presence candidate.
+fn select_presence(
+    field: &Field,
+    repetition: u32,
+    projected_structs: &HashSet<i32>,
+    requested_leaves: &HashSet<i32>,
+    index: &mut usize,
+    chosen: &mut Vec<FileLeaf>,
+) -> (bool, Option<FileLeaf>) {
+    // Unwrap once, like `Fields::filter_leaves`, so leaf indexes match it.
+    let data_type = match field.data_type() {
+        DataType::Dictionary(_, value) => value.as_ref(),
+        DataType::RunEndEncoded(_, values) => values.data_type(),
+        other => other,
+    };
+    match data_type {
+        DataType::Struct(children) => {
+            let mut covered = false;
+            let mut best: Option<FileLeaf> = None;
+            for child in children {
+                let (child_covered, child_best) = select_presence(
+                    child,
+                    repetition,
+                    projected_structs,
+                    requested_leaves,
+                    index,
+                    chosen,
+                );
+                covered |= child_covered;
+                if let Some(c) = child_best
+                    && best.is_none_or(|b| c.repetition < b.repetition)
+                {
+                    best = Some(c);
+                }
+            }
+            if !covered
+                && let Some(leaf) = best
+                && parquet_field_id(field).is_some_and(|id| projected_structs.contains(&id))
+            {
+                chosen.push(leaf);
+                covered = true;
+            }
+            (covered, best)
+        }
+        DataType::List(child)
+        | DataType::LargeList(child)
+        | DataType::FixedSizeList(child, _)
+        | DataType::Map(child, _) => select_presence(
+            child,
+            repetition + 1,
+            projected_structs,
+            requested_leaves,
+            index,
+            chosen,
+        ),
+        _ => {
+            let leaf = parquet_field_id(field).map(|id| FileLeaf {
+                repetition,
+                index: *index,
+                id,
+            });
+            *index += 1;
+            (
+                leaf.is_some_and(|leaf| requested_leaves.contains(&leaf.id)),
+                leaf,
+            )
+        }
+    }
 }
 
 /// Apply name mapping to Arrow schema for Parquet files lacking field IDs.
@@ -2480,6 +2597,223 @@ message schema {
             .into_iter(),
         )) as FileScanTaskStream;
 
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        assert_eq!(result, vec![expected]);
+    }
+
+    #[test]
+    fn test_projection_mask_reads_one_presence_leaf() {
+        fn field_id(name: &str, data_type: DataType, nullable: bool, id: i32) -> Field {
+            Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        }
+        // `s` is struct<6: b list<7: int>, 5: a int>. The table replaced both children.
+        // Presence must be `a` (lowest repetition level), not the list element and not
+        // every column.
+        let file_arrow = Arc::new(ArrowSchema::new(vec![
+            field_id("id", DataType::Int32, false, 1),
+            field_id(
+                "s",
+                DataType::Struct(
+                    vec![
+                        field_id(
+                            "b",
+                            DataType::List(Arc::new(field_id("element", DataType::Int32, true, 7))),
+                            true,
+                            6,
+                        ),
+                        field_id("a", DataType::Int32, true, 5),
+                    ]
+                    .into(),
+                ),
+                true,
+                2,
+            ),
+        ]));
+        let table = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(9, "n", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let parquet_schema = SchemaDescriptor::new(Arc::new(
+            parse_message_type(
+                "
+                message schema {
+                  required int32 id = 1;
+                  optional group s = 2 {
+                    optional group b (LIST) = 6 {
+                      repeated group list {
+                        optional int32 element = 7;
+                      }
+                    }
+                    optional int32 a = 5;
+                  }
+                }
+                ",
+            )
+            .unwrap(),
+        ));
+
+        let mask = |ids: &[i32]| {
+            ArrowReader::get_arrow_projection_mask(ids, &table, &parquet_schema, &file_arrow, false)
+                .unwrap()
+        };
+        assert_eq!(
+            mask(&[1, 2]),
+            ProjectionMask::leaves(&parquet_schema, vec![0, 2])
+        );
+        assert_eq!(mask(&[2]), ProjectionMask::leaves(&parquet_schema, vec![2]));
+        assert_eq!(mask(&[1]), ProjectionMask::leaves(&parquet_schema, vec![0]));
+    }
+
+    /// Cases from Java's `ReadFormatModelTests` for #17320, without initial-defaults:
+    /// every requested child of a struct is missing from the file, so its validity must
+    /// come from another leaf under it.
+    #[tokio::test]
+    async fn test_struct_presence_when_requested_children_missing() {
+        use serde_json::{Value, json};
+
+        use crate::arrow::schema_to_arrow_schema;
+        use crate::spec::{ListType, MapType, NestedFieldRef};
+
+        fn int(id: i32, name: &str) -> NestedFieldRef {
+            NestedField::optional(id, name, Type::Primitive(PrimitiveType::Int)).into()
+        }
+        fn int_struct(id: i32) -> Type {
+            Type::Struct(StructType::new(vec![int(id, "x")]))
+        }
+        // The table schema re-adds every struct child under a new id. `t` replaces its
+        // only child, a list, so presence comes from a repeated leaf.
+        fn schema(table: bool) -> Schema {
+            let id = |file_id: i32| if table { file_id + 100 } else { file_id };
+            let t = if table {
+                Type::Struct(StructType::new(vec![int(110, "n")]))
+            } else {
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(
+                        10,
+                        "tags",
+                        Type::List(ListType::new(
+                            NestedField::list_element(
+                                11,
+                                Type::Primitive(PrimitiveType::Int),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ]))
+            };
+            let s = Type::Struct(StructType::new(vec![
+                int(id(5), "x"),
+                NestedField::optional(7, "inner", int_struct(id(8))).into(),
+            ]));
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "s", s).into(),
+                    NestedField::optional(3, "t", t).into(),
+                    NestedField::optional(
+                        4,
+                        "m",
+                        Type::Map(MapType::optional(
+                            13,
+                            Type::Primitive(PrimitiveType::String),
+                            14,
+                            int_struct(id(15)),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        17,
+                        "l",
+                        Type::List(ListType::new(
+                            NestedField::list_element(18, int_struct(id(19)), false).into(),
+                        )),
+                    )
+                    .into(),
+                    // Java skips presence for a struct that can never be null. Here the
+                    // struct still needs a column, or it reads as a missing required field.
+                    NestedField::required(21, "r", int_struct(id(22))).into(),
+                ])
+                .build()
+                .unwrap()
+        }
+        fn to_batch(schema: &Schema, rows: Value) -> RecordBatch {
+            let fields = schema_to_arrow_schema(schema).unwrap().fields().to_vec();
+            serde_arrow::to_record_batch(&fields, &rows).unwrap()
+        }
+
+        let file_batch = to_batch(
+            &schema(false),
+            json!([
+                {"id": 1, "s": {"x": null, "inner": {"x": 5}}, "t": {"tags": [1]},
+                 "m": {"k": {"x": 7}, "k2": null}, "l": [{"x": 1}, null], "r": {"x": 1}},
+                {"id": 2, "s": {"x": 1, "inner": null}, "t": null,
+                 "m": null, "l": [], "r": {"x": 2}},
+                {"id": 3, "s": null, "t": {"tags": null},
+                 "m": {}, "l": null, "r": {"x": null}},
+                {"id": 4, "s": {"x": 2, "inner": {"x": null}}, "t": {"tags": [2, 3, 4]},
+                 "m": {"k": null}, "l": [null], "r": {"x": 4}},
+            ]),
+        );
+        let table_schema = Arc::new(schema(true));
+        let expected = to_batch(
+            &table_schema,
+            json!([
+                {"id": 1, "s": {"x": null, "inner": {"x": null}}, "t": {"n": null},
+                 "m": {"k": {"x": null}, "k2": null}, "l": [{"x": null}, null], "r": {"x": null}},
+                {"id": 2, "s": {"x": null, "inner": null}, "t": null,
+                 "m": null, "l": [], "r": {"x": null}},
+                {"id": 3, "s": null, "t": {"n": null},
+                 "m": {}, "l": null, "r": {"x": null}},
+                {"id": 4, "s": {"x": null, "inner": {"x": null}}, "t": {"n": null},
+                 "m": {"k": null}, "l": [null], "r": {"x": null}},
+            ]),
+        );
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/old.parquet", tmp_dir.path().to_str().unwrap());
+        let mut writer =
+            ArrowWriter::try_new(File::create(&file_path).unwrap(), file_batch.schema(), None)
+                .unwrap();
+        writer.write(&file_batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(table_schema)
+            .with_project_field_ids(vec![1, 2, 3, 4, 17, 21])
+            .with_case_sensitive(false)
+            .build()
+            .unwrap())])) as FileScanTaskStream;
         let result = reader
             .read(tasks)
             .unwrap()
