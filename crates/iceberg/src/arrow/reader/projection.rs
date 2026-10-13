@@ -448,6 +448,8 @@ fn presence_leaves(
 }
 
 /// Returns whether a selected leaf is under `field`, and the best presence candidate.
+/// The type check needs a field id on every field down to the leaf, except a map's
+/// entries struct, so a candidate is only taken from a child with an id.
 fn select_presence(
     field: &Field,
     repetition: u32,
@@ -477,6 +479,7 @@ fn select_presence(
                 );
                 covered |= child_covered;
                 if let Some(c) = child_best
+                    && parquet_field_id(child).is_some()
                     && best.is_none_or(|b| c.repetition < b.repetition)
                 {
                     best = Some(c);
@@ -492,14 +495,15 @@ fn select_presence(
             (covered, best)
         }
         DataType::List(child) | DataType::LargeList(child) | DataType::FixedSizeList(child, _) => {
-            select_presence(
+            let (covered, best) = select_presence(
                 child,
                 repetition + 1,
                 projected_structs,
                 requested_leaves,
                 index,
                 chosen,
-            )
+            );
+            (covered, best.filter(|_| parquet_field_id(child).is_some()))
         }
         DataType::Map(child, _) => {
             let start = *index;
@@ -526,13 +530,13 @@ fn select_presence(
             let start = *index;
             *index += 1;
             // Presence leaves go through the type check, so they must convert.
-            let leaf = (id.is_some() && arrow_type_to_type(field.data_type()).is_ok()).then_some(
-                FileLeaf {
+            let leaf = arrow_type_to_type(field.data_type())
+                .is_ok()
+                .then_some(FileLeaf {
                     repetition,
                     start,
                     end: *index,
-                },
-            );
+                });
             (id.is_some_and(|id| requested_leaves.contains(&id)), leaf)
         }
     }
@@ -2641,9 +2645,9 @@ message schema {
                 id.to_string(),
             )]))
         }
-        // `s` is struct<6: b list<7: int>, 8: u uint64, 5: a int, 3: c int>, and the table
-        // replaced every child. Presence must be `a`: the first leaf with the lowest
-        // repetition level whose type converts, so not every column.
+        // `s` is struct<6: b list<7: int>, w struct<14: int>, 8: u uint64, 5: a int, 3: c int>,
+        // and the table replaced every child. Presence must be `a`: the first leaf with the
+        // lowest repetition level that the type check accepts, so not every column.
         let file_arrow = Arc::new(ArrowSchema::new(vec![
             field_id("id", DataType::Int32, false, 1),
             field_id(
@@ -2656,6 +2660,13 @@ message schema {
                             true,
                             6,
                         ),
+                        Field::new(
+                            "w",
+                            DataType::Struct(
+                                vec![field_id("a2", DataType::Int32, true, 14)].into(),
+                            ),
+                            true,
+                        ),
                         field_id("u", DataType::UInt64, true, 8),
                         field_id("a", DataType::Int32, true, 5),
                         field_id("c", DataType::Int32, true, 3),
@@ -2665,29 +2676,44 @@ message schema {
                 true,
                 2,
             ),
-            // `v` has only a map, which is read whole for presence, so it must convert.
+            // `v` has no usable leaf: its map is read whole and must convert, and its list
+            // element has no id.
             field_id(
                 "v",
                 DataType::Struct(
-                    vec![field_id(
-                        "m",
-                        DataType::Map(
-                            Arc::new(Field::new(
-                                "key_value",
-                                DataType::Struct(
-                                    vec![
-                                        field_id("key", DataType::Utf8, false, 11),
-                                        field_id("value", DataType::UInt64, true, 12),
-                                    ]
-                                    .into(),
-                                ),
+                    vec![
+                        field_id(
+                            "m",
+                            DataType::Map(
+                                Arc::new(Field::new(
+                                    "key_value",
+                                    DataType::Struct(
+                                        vec![
+                                            field_id("key", DataType::Utf8, false, 11),
+                                            field_id("value", DataType::UInt64, true, 12),
+                                        ]
+                                        .into(),
+                                    ),
+                                    false,
+                                )),
                                 false,
-                            )),
-                            false,
+                            ),
+                            true,
+                            10,
                         ),
-                        true,
-                        10,
-                    )]
+                        field_id(
+                            "q",
+                            DataType::List(Arc::new(Field::new(
+                                "element",
+                                DataType::Struct(
+                                    vec![field_id("z", DataType::Int32, true, 16)].into(),
+                                ),
+                                true,
+                            ))),
+                            true,
+                            15,
+                        ),
+                    ]
                     .into(),
                 ),
                 true,
@@ -2732,6 +2758,9 @@ message schema {
                         optional int32 element = 7;
                       }
                     }
+                    optional group w {
+                      optional int32 a2 = 14;
+                    }
                     optional int64 u (INTEGER(64, false)) = 8;
                     optional int32 a = 5;
                     optional int32 c = 3;
@@ -2741,6 +2770,13 @@ message schema {
                       repeated group key_value {
                         required binary key (STRING) = 11;
                         optional int64 value (INTEGER(64, false)) = 12;
+                      }
+                    }
+                    optional group q (LIST) = 15 {
+                      repeated group list {
+                        optional group element {
+                          optional int32 z = 16;
+                        }
                       }
                     }
                   }
@@ -2756,9 +2792,9 @@ message schema {
         };
         assert_eq!(
             mask(&[1, 2]),
-            ProjectionMask::leaves(&parquet_schema, vec![0, 3])
+            ProjectionMask::leaves(&parquet_schema, vec![0, 4])
         );
-        assert_eq!(mask(&[2]), ProjectionMask::leaves(&parquet_schema, vec![3]));
+        assert_eq!(mask(&[2]), ProjectionMask::leaves(&parquet_schema, vec![4]));
         assert_eq!(mask(&[1]), ProjectionMask::leaves(&parquet_schema, vec![0]));
         assert_eq!(
             mask(&[1, 4]),
