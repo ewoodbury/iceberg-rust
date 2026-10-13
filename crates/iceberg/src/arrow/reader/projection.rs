@@ -500,9 +500,9 @@ impl PresenceWalk<'_> {
             | DataType::FixedSizeList(child, _) => self.visit(child, repetition + 1, in_projected),
             DataType::Map(entries, _) => {
                 let start = self.index;
-                let (covered, _) = self.visit(entries, repetition + 1, in_projected);
                 // Parquet drops a map unless both its key and value are read, so the
-                // candidate is the whole map.
+                // candidate is the whole map and its entries need none of their own.
+                let (covered, _) = self.visit(entries, repetition + 1, false);
                 let readable =
                     in_projected && !covered && arrow_type_to_type(field.data_type()).is_ok();
                 let leaf = readable.then_some(PresenceCandidate {
